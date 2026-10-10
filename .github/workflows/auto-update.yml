@@ -1,0 +1,468 @@
+name: Auto Sanitize Repo
+
+on:
+  schedule:
+    # 00:00 UTC = 03:00 Egypt during August.
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  update-and-sanitize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # ------------------------------------------------------------
+      # 1. Checkout our repository
+      # ------------------------------------------------------------
+      - name: Checkout NaziU repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ------------------------------------------------------------
+      # 2. Save our custom files, then synchronize with Keiyoushi
+      # ------------------------------------------------------------
+      - name: Synchronize with Keiyoushi
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "Saving custom files..."
+
+          mkdir -p /tmp/naziu-backup/.github/workflows
+
+          cp .github/workflows/auto-update.yml \
+            /tmp/naziu-backup/.github/workflows/auto-update.yml
+
+          if [ -f sanitize.py ]; then
+            cp sanitize.py /tmp/naziu-backup/sanitize.py
+          fi
+
+          echo "Adding Keiyoushi upstream..."
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/keiyoushi/extensions.git
+
+          echo "Fetching Keiyoushi repo branch..."
+
+          git fetch --prune upstream repo
+
+          echo "Resetting repository to latest Keiyoushi repo..."
+
+          git reset --hard FETCH_HEAD
+
+          echo "Restoring custom files..."
+
+          mkdir -p .github/workflows
+
+          cp /tmp/naziu-backup/.github/workflows/auto-update.yml \
+            .github/workflows/auto-update.yml
+
+          if [ -f /tmp/naziu-backup/sanitize.py ]; then
+            cp /tmp/naziu-backup/sanitize.py sanitize.py
+          fi
+
+          echo "Synchronization complete."
+
+      # ------------------------------------------------------------
+      # 3. Install protobuf
+      # ------------------------------------------------------------
+      - name: Install Python dependencies
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --upgrade protobuf
+
+      # ------------------------------------------------------------
+      # 4. Download the official Keiyoushi protobuf bindings
+      # ------------------------------------------------------------
+      - name: Prepare protobuf bindings
+        run: |
+          set -euo pipefail
+
+          curl --fail --silent --show-error --location \
+            https://raw.githubusercontent.com/keiyoushi/extensions-source/main/.github/scripts/index_pb2.py \
+            -o index_pb2.py
+
+          python3 - <<'PY'
+          import index_pb2
+
+          print("Protobuf bindings loaded successfully.")
+          print(
+              "Content warning values:",
+              index_pb2.CONTENT_WARNING_SAFE,
+              index_pb2.CONTENT_WARNING_MIXED,
+              index_pb2.CONTENT_WARNING_NSFW,
+          )
+          PY
+
+      # ------------------------------------------------------------
+      # 5. Run sanitizer
+      # ------------------------------------------------------------
+      - name: Sanitize repository
+        run: |
+          set -euo pipefail
+
+          python3 sanitize.py
+
+      # ------------------------------------------------------------
+      # 6. Generate index.pb and correct legacy index.min.json
+      # ------------------------------------------------------------
+      - name: Generate repository indexes
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import gzip
+          import json
+          from google.protobuf import json_format
+          import index_pb2
+
+          print("Loading sanitized index.json...")
+
+          with open("index.json", "r", encoding="utf-8") as f:
+              json_data = f.read()
+
+          index = json_format.Parse(
+              json_data,
+              index_pb2.Index()
+          )
+
+          extensions = list(index.extensionList.extensions)
+
+          print(f"Extensions after sanitization: {len(extensions)}")
+
+          # --------------------------------------------------------
+          # Generate index.pb
+          # This matches Keiyoushi's official publisher.
+          # --------------------------------------------------------
+
+          with open("index.pb", "wb") as f:
+              f.write(
+                  gzip.compress(
+                      index.SerializeToString()
+                  )
+              )
+
+          print("Generated index.pb")
+
+          # --------------------------------------------------------
+          # Generate legacy index.min.json
+          # This matches Keiyoushi's official publisher.
+          # --------------------------------------------------------
+
+          def get_legacy_lang(extension):
+              apk_filename = extension.resources.apkUrl.split("/")[-1]
+
+              # Example:
+              # tachiyomi-en.mangadex-v1.2.3.apk
+              #
+              # The official publisher extracts the language from
+              # the APK filename.
+              import re
+
+              match = re.search(
+                  r"tachiyomi-([^.]+)",
+                  apk_filename
+              )
+
+              if match:
+                  lang = match.group(1)
+              else:
+                  lang = "all"
+
+              if len(extension.sources) == 1:
+                  source_language = extension.sources[0].language
+
+                  if (
+                      source_language != lang
+                      and source_language not in {"all", "other"}
+                      and lang not in {"all", "other"}
+                  ):
+                      lang = source_language
+
+              return lang
+
+          legacy_json_index = []
+
+          for extension in extensions:
+
+              legacy_json_index.append(
+                  {
+                      "name": f"Tachiyomi: {extension.name}",
+                      "pkg": extension.packageName,
+                      "apk": extension.resources.apkUrl.split("/")[-1],
+                      "lang": get_legacy_lang(extension),
+                      "code": extension.versionCode,
+                      "version": extension.versionName,
+
+                      # IMPORTANT:
+                      # NSFW = 1
+                      # SAFE/MIXED = 0 in the legacy format.
+                      #
+                      # Because our sanitizer removes MIXED,
+                      # everything remaining here should be SAFE.
+                      "nsfw": (
+                          1
+                          if extension.contentWarning
+                          == index_pb2.CONTENT_WARNING_NSFW
+                          else 0
+                      ),
+
+                      "sources": [
+                          {
+                              "name": source.name,
+                              "lang": source.language,
+                              "id": str(source.id),
+                              "baseUrl": source.homeUrl,
+                          }
+                          for source in extension.sources
+                      ],
+                  }
+              )
+
+          with open(
+              "index.min.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  legacy_json_index,
+                  f,
+                  ensure_ascii=False,
+                  separators=(",", ":")
+              )
+
+          print("Generated index.min.json")
+
+          PY
+
+      # ------------------------------------------------------------
+      # 7. Validate JSON
+      # ------------------------------------------------------------
+      - name: Validate JSON files
+        run: |
+          set -euo pipefail
+
+          python3 -m json.tool index.json > /dev/null
+          python3 -m json.tool index.min.json > /dev/null
+          python3 -m json.tool index.removed.json > /dev/null
+
+          echo "All JSON files are valid."
+
+      # ------------------------------------------------------------
+      # 8. Validate protobuf and make absolutely sure no NSFW/MIXED
+      #    extensions survived.
+      # ------------------------------------------------------------
+      - name: Verify sanitized repository
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import gzip
+          import json
+          import sys
+
+          from google.protobuf import json_format
+
+          import index_pb2
+
+          # ------------------------------------------------------
+          # Verify index.json
+          # ------------------------------------------------------
+
+          with open("index.json", "r", encoding="utf-8") as f:
+              index_json = json.load(f)
+
+          extensions = index_json["extensionList"]["extensions"]
+
+          forbidden = []
+
+          for extension in extensions:
+              warning = str(
+                  extension.get("contentWarning", "")
+              ).upper()
+
+              if (
+                  "CONTENT_WARNING_NSFW" in warning
+                  or "CONTENT_WARNING_MIXED" in warning
+              ):
+                  forbidden.append(
+                      extension.get("name", "<unknown>")
+                  )
+
+          if forbidden:
+              print(
+                  "ERROR: Forbidden extensions remain in index.json:"
+              )
+
+              for name in forbidden:
+                  print(f"  - {name}")
+
+              sys.exit(1)
+
+          print(
+              f"index.json verification passed: "
+              f"{len(extensions)} extensions remain."
+          )
+
+          # ------------------------------------------------------
+          # Verify index.pb
+          # ------------------------------------------------------
+
+          with open("index.pb", "rb") as f:
+              compressed = f.read()
+
+          try:
+              protobuf_data = gzip.decompress(compressed)
+          except gzip.BadGzipFile:
+              print(
+                  "ERROR: index.pb is not valid gzip data.",
+                  file=sys.stderr
+              )
+              sys.exit(2)
+
+          index = index_pb2.Index()
+          index.ParseFromString(protobuf_data)
+
+          pb_forbidden = []
+
+          for extension in index.extensionList.extensions:
+              if extension.contentWarning in (
+                  index_pb2.CONTENT_WARNING_MIXED,
+                  index_pb2.CONTENT_WARNING_NSFW,
+              ):
+                  pb_forbidden.append(extension.name)
+
+          if pb_forbidden:
+              print(
+                  "ERROR: Forbidden extensions remain in index.pb:"
+              )
+
+              for name in pb_forbidden:
+                  print(f"  - {name}")
+
+              sys.exit(3)
+
+          print(
+              f"index.pb verification passed: "
+              f"{len(index.extensionList.extensions)} extensions remain."
+          )
+
+          # ------------------------------------------------------
+          # Verify legacy index.min.json
+          # ------------------------------------------------------
+
+          with open(
+              "index.min.json",
+              "r",
+              encoding="utf-8"
+          ) as f:
+              legacy = json.load(f)
+
+          legacy_forbidden = [
+              entry.get("name")
+              for entry in legacy
+              if entry.get("nsfw") == 1
+          ]
+
+          if legacy_forbidden:
+              print(
+                  "ERROR: NSFW entries remain in index.min.json:"
+              )
+
+              for name in legacy_forbidden:
+                  print(f"  - {name}")
+
+              sys.exit(4)
+
+          print(
+              f"index.min.json verification passed: "
+              f"{len(legacy)} extensions remain."
+          )
+
+          print("")
+          print("==========================================")
+          print("SANITIZATION VERIFICATION SUCCESSFUL")
+          print("==========================================")
+          PY
+
+      # ------------------------------------------------------------
+      # 9. Show what changed
+      # ------------------------------------------------------------
+      - name: Show changes
+        run: |
+          set -euo pipefail
+
+          echo "===== Git status ====="
+
+          git status --short
+
+          echo ""
+          echo "===== Diff statistics ====="
+
+          git --no-pager diff --stat
+
+          echo ""
+          echo "===== Removed extensions ====="
+
+          if [ -f index.removed.json ]; then
+            python3 - <<'PY'
+          import json
+
+          with open("index.removed.json", "r", encoding="utf-8") as f:
+              removed = json.load(f)
+
+          print(f"Removed extensions: {len(removed)}")
+
+          for extension in removed[:20]:
+              print(
+                  " -",
+                  extension.get("name"),
+                  "|",
+                  extension.get("packageName"),
+                  "|",
+                  extension.get("contentWarning")
+              )
+
+          if len(removed) > 20:
+              print(
+                  f"... and {len(removed) - 20} more."
+              )
+          PY
+          fi
+
+      # ------------------------------------------------------------
+      # 10. Commit and push
+      # ------------------------------------------------------------
+      - name: Commit and push changes
+        run: |
+          set -euo pipefail
+
+          git add \
+            index.json \
+            index.min.json \
+            index.pb \
+            index.removed.json \
+            .github/workflows/auto-update.yml \
+            sanitize.py
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit \
+            -m "Auto-update and sanitize extensions"
+
+          git push --force origin HEAD:repo
